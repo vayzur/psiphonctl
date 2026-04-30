@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+
+CONFIG_FILE=/etc/psiphon/config.json
+
+need_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Error: this command requires root. Run it with sudo."
+    exit 1
+  fi
+}
+
+port_in_use() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn "sport = :$1" 2>/dev/null | sed -n '2,$p' | grep -q .
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | grep -q ":$1 "
+  else
+    return 1
+  fi
+}
+
+print_help() {
+  cat <<'EOF'
+pctl commands:
+  start            Start the psiphon service
+  stop             Stop the psiphon service
+  restart          Restart psiphon if the configured ports are free
+  status           Show service state, region, ports, and uptime
+  logs             Follow psiphon logs
+  ports            Show the current HTTP and SOCKS ports
+  country <CODE>   Set the egress region
+  country list     Show supported country codes
+  http <PORT>      Set the HTTP proxy port
+  socks <PORT>     Set the SOCKS proxy port
+  config show      Pretty-print the active config
+  update           Download the latest psiphon-core binary
+  uninstall        Remove Psiphon and all installed files
+  help             Show this help
+EOF
+}
+
+format_uptime() {
+  s="$1"
+  d=$((s / 86400))
+  s=$((s % 86400))
+  h=$((s / 3600))
+  s=$((s % 3600))
+  m=$((s / 60))
+  s=$((s % 60))
+  out=""
+  [ "$d" -gt 0 ] && out="$out$d""d "
+  [ "$h" -gt 0 ] && out="$out$h""h "
+  [ "$m" -gt 0 ] && out="$out$m""m "
+  out="$out$s""s"
+  printf '%s\n' "$out"
+}
+
+download_latest_core() {
+  curl -fsSL https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core-binaries/master/linux/psiphon-tunnel-core-x86_64 -o "$1" || return 1
+}
+
+case "$1" in
+  start)
+    need_root
+    systemctl start psiphon || exit 1
+    ;;
+  stop)
+    need_root
+    systemctl stop psiphon || exit 1
+    ;;
+  restart)
+    need_root
+    if systemctl is-active --quiet psiphon; then
+      systemctl restart psiphon || exit 1
+    else
+      http_port="$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d['LocalHttpProxyPort'])")"
+      socks_port="$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d['LocalSocksProxyPort'])")"
+      if port_in_use "$http_port"; then
+        echo "Error: port $http_port is already in use. Free it or change the HTTP port with 'pctl http <PORT>'."
+        exit 1
+      fi
+      if port_in_use "$socks_port"; then
+        echo "Error: port $socks_port is already in use. Free it or change the SOCKS port with 'pctl socks <PORT>'."
+        exit 1
+      fi
+      systemctl restart psiphon || exit 1
+    fi
+    ;;
+  status)
+    service_state="$(systemctl is-active psiphon 2>/dev/null)"
+    region="$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d['EgressRegion'])")"
+    http_port="$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d['LocalHttpProxyPort'])")"
+    socks_port="$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d['LocalSocksProxyPort'])")"
+    uptime="n/a"
+    if [ "$service_state" = "active" ]; then
+      start_us="$(systemctl show -p ActiveEnterTimestampMonotonic --value psiphon 2>/dev/null)"
+      if [ -n "$start_us" ] && [ "$start_us" -gt 0 ]; then
+        read up _ < /proc/uptime
+        now_us="${up%.*}000000"
+        elapsed=$(((now_us - start_us) / 1000000))
+        uptime="$(format_uptime "$elapsed")"
+      fi
+    fi
+    echo "Service state: ${service_state:-unknown}"
+    echo "Current region: $region"
+    echo "HTTP port: $http_port"
+    echo "SOCKS port: $socks_port"
+    echo "Uptime: $uptime"
+  ;;
+  logs)
+    journalctl -u psiphon -f --no-pager
+    ;;
+  ports)
+    http_port="$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d['LocalHttpProxyPort'])")"
+    socks_port="$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d['LocalSocksProxyPort'])")"
+    echo "HTTP: $http_port"
+    echo "SOCKS: $socks_port"
+    ;;
+  country)
+    case "$2" in
+      list)
+        echo "US  United States"
+        echo "CA  Canada"
+        echo "BE  Belgium"
+        echo "CH  Switzerland"
+        echo "CZ  Czech Republic"
+        echo "GB  United Kingdom"
+        echo "DE  Germany"
+        echo "DK  Denmark"
+        echo "ES  Spain"
+        echo "FI  Finland"
+        echo "FR  France"
+        echo "ID  Indonesia"
+        echo "IE  Ireland"
+        echo "IT  Italy"
+        echo "LT  Lithuania"
+        echo "MX  Mexico"
+        echo "NL  Netherlands"
+        echo "AT  Austria"
+        echo "AU  Australia"
+        echo "IN  India"
+        echo "JP  Japan"
+        echo "NO  Norway"
+        echo "PL  Poland"
+        echo "RO  Romania"
+        echo "RS  Serbia"
+        echo "SE  Sweden"
+        echo "SG  Singapore"
+        ;;
+      AT|AU|BE|CA|CH|CZ|DE|DK|ES|FI|FR|GB|ID|IE|IN|IT|JP|LT|MX|NL|NO|PL|RO|RS|SE|SG|US)
+        need_root
+        python3 -c "import json; f=open('$CONFIG_FILE'); d=json.load(f); f.close(); d['EgressRegion']='$2'; open('$CONFIG_FILE','w').write(json.dumps(d,indent=2))" || exit 1
+        echo "Region set to $2. Run 'pctl restart' to apply."
+        ;;
+      *)
+        echo "Error: invalid country code. Use 'pctl country list' for valid codes."
+        exit 1
+        ;;
+    esac
+    ;;
+  http)
+    need_root
+    if ! [[ "$2" =~ ^[0-9]+$ ]] || [ "$2" -lt 1024 ] || [ "$2" -gt 65535 ]; then
+      echo "Error: port must be a number between 1024 and 65535."
+      exit 1
+    fi
+    python3 -c "import json; f=open('$CONFIG_FILE'); d=json.load(f); f.close(); d['LocalHttpProxyPort']=int('$2'); open('$CONFIG_FILE','w').write(json.dumps(d,indent=2))" || exit 1
+    echo "HTTP port set to $2. Run 'pctl restart' to apply."
+    ;;
+  socks)
+    need_root
+    if ! [[ "$2" =~ ^[0-9]+$ ]] || [ "$2" -lt 1024 ] || [ "$2" -gt 65535 ]; then
+      echo "Error: port must be a number between 1024 and 65535."
+      exit 1
+    fi
+    python3 -c "import json; f=open('$CONFIG_FILE'); d=json.load(f); f.close(); d['LocalSocksProxyPort']=int('$2'); open('$CONFIG_FILE','w').write(json.dumps(d,indent=2))" || exit 1
+    echo "SOCKS port set to $2. Run 'pctl restart' to apply."
+    ;;
+  config)
+    case "$2" in
+      show)
+        python3 -m json.tool "$CONFIG_FILE"
+        ;;
+      *)
+        print_help
+        ;;
+    esac
+    ;;
+  update)
+    need_root
+    old_version="$(/usr/local/bin/psiphon-core -version 2>/dev/null | head -n 1)"
+    [ -n "$old_version" ] || old_version="unknown"
+    was_active=0
+    if systemctl is-active --quiet psiphon; then
+      was_active=1
+      systemctl stop psiphon || exit 1
+    fi
+    tmpfile="$(mktemp)"
+    if ! download_latest_core "$tmpfile"; then
+      echo "Error: failed to download the latest psiphon-core binary."
+      [ "$was_active" -eq 1 ] && systemctl start psiphon >/dev/null 2>&1
+      rm -f "$tmpfile"
+      exit 1
+    fi
+    chmod +x "$tmpfile"
+    new_version="$("$tmpfile" -version 2>/dev/null | head -n 1)"
+    [ -n "$new_version" ] || new_version="unknown"
+    install -m 0755 "$tmpfile" /usr/local/bin/psiphon-core || {
+      echo "Error: failed to install the new binary."
+      [ "$was_active" -eq 1 ] && systemctl start psiphon >/dev/null 2>&1
+      rm -f "$tmpfile"
+      exit 1
+    }
+    rm -f "$tmpfile"
+    if [ "$was_active" -eq 1 ]; then
+      systemctl start psiphon || exit 1
+    fi
+    echo "Old version: $old_version"
+    echo "New version: $new_version"
+    ;;
+  uninstall)
+    need_root
+    systemctl stop psiphon >/dev/null 2>&1
+    systemctl disable psiphon >/dev/null 2>&1
+    rm -f /etc/systemd/system/psiphon.service
+    systemctl daemon-reload
+    rm -f /usr/local/bin/psiphon-core
+    rm -f /usr/local/bin/pctl
+    rm -rf /etc/psiphon/
+    echo "Psiphon fully removed."
+    ;;
+  help|"")
+    print_help
+    ;;
+  *)
+    print_help
+    exit 1
+    ;;
+esac
